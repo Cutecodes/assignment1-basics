@@ -3,6 +3,13 @@ import torch
 import torch.nn as nn
 import math
 
+class DirectForward(nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, x):
+        return x
+
 class Linear(nn.Module):
     def __init__(self, d_in: int, d_out: int, device=None, dtype=None):
         """带有初始化功能的线性层
@@ -97,6 +104,15 @@ class SiLU(nn.Module):
 
 def silu(x):
     return x / (1 + torch.exp(-x))
+
+class SiluFFN(nn.Module):
+    def __init__(self, d_model: int, d_ff: int):
+        super().__init__()
+        self.w1 = self.w1 = Linear(d_model, d_ff)
+        self.w2 = Linear(d_ff, d_model)
+
+    def forward(self, x):
+        return self.w2(silu(self.w1(x)))
 
 class SwiGLU(nn.Module):
     def __init__(self, d_model: int, d_ff: int):

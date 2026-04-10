@@ -5,7 +5,7 @@ import argparse
 from typing import Dict, Optional, Tuple
 from pathlib import Path
 from cs336_basics.data import get_batch
-from cs336_basics.model import TransformerLM, RoPE
+from cs336_basics.model import TransformerLM, RoPE, DirectForward, SiluFFN
 from cs336_basics.optimizer import AdamW, get_cosine_lr
 from cs336_basics.nn_utils import (
     cross_entropy,
@@ -24,23 +24,6 @@ class TextDataset:
 
     def get_batch(self, batch_size:int, context_length: int, device: str = "cpu"):
         return get_batch(self.dataset, batch_size, context_length, device)
-
-
-
-# 
-# import sys
-# import json
-# import math
-# 
-# from datetime import datetime
-
-# 
-
-# 
-# import torch.nn as nn
-# from torch.utils.data import Dataset, DataLoader
-# from torch.optim import AdamW
-# from torch.optim.lr_scheduler import CosineAnnealingLR
 
 try:
     import swanlab
@@ -374,7 +357,45 @@ def parse_args():
     parser.add_argument("--wandb_project", type=str, default="cs336", help="WandB project name")
     parser.add_argument("--wandb_run_name", type=str, default=None, help="WandB run name (optional, auto-generated if not provided)")
     
+    parser.add_argument("--no_rmsnorm", action="store_true", help="Ablation 1: Remove all RMSNorm layers (use LayerNorm instead or no norm)")
+    parser.add_argument("--use_post_norm", action="store_true", help="Ablation 2: Use Post-Norm structure instead of Pre-Norm")
+    parser.add_argument("--no_rope", action="store_true", help="Ablation 3: Remove RoPE position embeddings (NoPE)")
+    parser.add_argument("--use_silu_ffn", action="store_true", help="Ablation 4: Replace SwiGLU with SiLU feedforward network (no gating)")
     return parser.parse_args()
+
+def patch_no_rmsnorm(model):
+    print("Patch RMSNorm")
+    num_layers = len(model.transformer_layers)
+
+    for i in range(num_layers):
+        model.transformer_layers[i].ln1 = DirectForward()
+        model.transformer_layers[i].ln2 = DirectForward()
+
+    model.ln_final = DirectForward()
+
+def post_norm_forward(self, x):
+    
+    x_attn = self.attn(x)
+    attn_sublayer_output = self.ln1(x + x_attn)
+
+    x_ffn = self.ffn(attn_sublayer_output)
+    ffn_sublayer_output = self.ln2(attn_sublayer_output + x_ffn)
+    return ffn_sublayer_output
+
+def patch_post_norm(model):
+    print("Patch PostNorm")
+    num_layers = len(model.transformer_layers)
+
+    for i in range(num_layers):
+        layer = model.transformer_layers[i]
+        layer.forward = lambda x, self=layer: post_norm_forward(self, x)
+
+def patch_silu_ffn(model, d_model, d_ff):
+    print("Patch Silu FFN")
+    num_layers = len(model.transformer_layers)
+
+    for i in range(num_layers):
+        model.transformer_layers[i].ffn = SiluFFN(d_model, d_ff)
 
 def main():
     args = parse_args()
@@ -390,7 +411,12 @@ def main():
 
     # Create model, optimizer, scheduler
     print("Building model...")
+
+    
     rope = RoPE(config.rope_theta, config.d_model // config.num_heads, config.context_length)
+    if args.no_rope:
+        rope = None
+    
     model = TransformerLM(
         config.vocab_size,
         config.context_length, 
@@ -400,6 +426,16 @@ def main():
         config.d_ff, 
         rope
     )
+
+    if args.no_rmsnorm:
+        patch_no_rmsnorm(model)
+    
+    if args.use_post_norm:
+        patch_post_norm(model)
+    
+    if args.use_silu_ffn:
+        patch_silu_ffn(model, config.d_model, config.d_model * 4)
+
     model.to(config.device)
 
     # Use AdamW optimizer
